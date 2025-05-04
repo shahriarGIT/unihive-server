@@ -8,6 +8,8 @@ import http from "http";
 import { Server } from "socket.io";
 import cors from "cors";
 
+import userRouter from "./routes/userRouter.js";
+
 const app = express();
 
 // Models
@@ -15,9 +17,16 @@ import Quiz from "./models/Quiz.js";
 import QuizRoom from "./models/QuizRoom.js";
 
 export const server = http.createServer(app);
-app.use(cors());
+// app.use(cors());
 app.use(express.json());
 // Allow CORS from your frontend
+
+const corsOptions = {
+  origin: "http://localhost:3000", // Specific frontend origin
+  credentials: true, // Allow cookies
+};
+
+app.use(cors(corsOptions));
 
 const io = new Server(server, {
   cors: {
@@ -28,6 +37,8 @@ const io = new Server(server, {
 
 import dotenv from "dotenv";
 dotenv.config();
+
+app.use("/api/users", userRouter);
 
 const rooms = {}; // Save room data temporarily
 const roomUsers = {}; // { roomName: [ { id, name }, ... ] }
