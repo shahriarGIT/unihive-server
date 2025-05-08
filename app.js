@@ -36,6 +36,7 @@ const io = new Server(server, {
 });
 
 import dotenv from "dotenv";
+import Flashcard from "./models/flashcardModel.js";
 dotenv.config();
 
 app.use("/api/users", userRouter);
@@ -529,6 +530,68 @@ io.on("connection", (socket) => {
     console.log("Client disconnected:", socket.id);
     // Optionally: Handle user leaving room and update DB if necessary
   });
+});
+
+// ---------------------- Flashcards -------------------------
+// Create flashcard
+app.post("/api/create-flashcard", async (req, res) => {
+  console.log("from flashcard", req.body);
+
+  try {
+    const flashcard = new Flashcard({
+      ...req.body,
+    });
+    await flashcard.save();
+    res.status(201).send(flashcard);
+  } catch (error) {
+    res.status(400).send(error);
+  }
+});
+
+// Get user's flashcards
+app.get("/api/flashcards", async (req, res) => {
+  console.log("from flashcard", req.body, req.query.userId);
+
+  try {
+    const flashcards = await Flashcard.find({ userId: req.query.userId });
+    res.send(flashcards);
+  } catch (error) {
+    res.status(500).send(error);
+  }
+});
+
+// Add to your flashcards routes
+app.get("/api/flashcard/:id", async (req, res) => {
+  try {
+    const flashcard = await Flashcard.findOne({
+      _id: req.params.id,
+    });
+
+    if (!flashcard) return res.status(404).send();
+    res.send(flashcard);
+  } catch (error) {
+    res.status(500).send(error);
+  }
+});
+
+app.patch("/api/flashcard/:flashcardId", async (req, res) => {
+  console.log("from flashcard patch", req.body, req.params.flashcardId);
+
+  try {
+    const flashcard = await Flashcard.findOneAndUpdate(
+      {
+        _id: req.params.flashcardId,
+        // userId: req.user.id, // Only owner can update
+      },
+      { isPublic: req.body.isPublic },
+      { new: true }
+    );
+
+    if (!flashcard) return res.status(404).send();
+    res.send(flashcard);
+  } catch (error) {
+    res.status(400).send(error);
+  }
 });
 
 const port = process.env.PORT;
