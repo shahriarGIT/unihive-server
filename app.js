@@ -7,6 +7,7 @@ import bodyParser from "body-parser";
 import http from "http";
 import { Server } from "socket.io";
 import cors from "cors";
+import mongoose from "mongoose";
 
 import userRouter from "./routes/userRouter.js";
 
@@ -37,6 +38,8 @@ const io = new Server(server, {
 
 import dotenv from "dotenv";
 import Flashcard from "./models/flashcardModel.js";
+import { log } from "console";
+import UserPoints from "./models/scoreModel.js";
 dotenv.config();
 
 app.use("/api/users", userRouter);
@@ -299,11 +302,15 @@ app.post("/api/join-quiz-room", async (req, res) => {
 });
 
 app.post("/api/submit-quiz", async (req, res) => {
-  const { quizId, roomName, userId, answers } = req.body;
+  const { quizId, roomName, userId, firstname, answers } = req.body;
 
   try {
     const quiz = await Quiz.findById(quizId);
     if (!quiz) return res.status(404).json({ error: "Quiz not found" });
+
+    const room = await QuizRoom.findOne({ roomName });
+
+    console.log("from submit quiz", roomName, room);
 
     let score = 0;
 
@@ -328,6 +335,17 @@ app.post("/api/submit-quiz", async (req, res) => {
     // await Submission.create({ userId, quizId, roomName, answers, score });
 
     // (Optional) Update finished count or user status in room if needed
+
+    await UserPoints.findOneAndUpdate(
+      { userId }, // match user
+      {
+        roomId: room._id,
+        firstname, // send from client
+        lastScore: score, // this quiz
+        $inc: { totalScore: score }, // add to running total
+      },
+      { upsert: true, new: true } // create if not exists
+    );
 
     return res.json({ score });
   } catch (err) {
@@ -372,139 +390,175 @@ app.post("/api/submit-quiz", async (req, res) => {
 // });
 const userProgress = {}; // temp in-memory store: { roomName: { userId: score } }
 const finishedParticipants = new Map(); // roomName -> Set of userIds
+const socketUserMap = new Map();
+const userSocketMap = new Map();
 
+function findSocketIdByUser(userId) {
+  return userSocketMap.get(userId);
+}
 io.on("connection", (socket) => {
   console.log("New client connected for quiz lobby:", socket.id);
 
-  // Handle room joining
-  socket.on("joinRoom", async ({ roomName, roomPassword, user }) => {
-    console.log("User trying to join room:", roomName, user);
+  socket.on("joinRoom", async ({ roomName, user }) => {
+    console.log("User trying to join room: quiz", roomName, user);
+    userSocketMap.set(user.id, socket.id);
 
+    socket.on("disconnect", () => {
+      userSocketMap.delete(user.id);
+    });
     try {
-      // Find the room by roomName
       const room = await QuizRoom.findOne({ roomName });
 
       if (!room) {
-        // Room doesn't exist
         socket.emit("joinError", { message: "Room not found" });
         return;
       }
 
-      // Check if the password matches
-      if (room.roomPassword !== roomPassword) {
-        // Incorrect password
-        socket.emit("joinError", { message: "Incorrect password" });
-        return;
-      }
-
-      // Join the room
-
       socket.join(room._id.toString());
-      console.log(`${user.name} joined room ${room._id}`);
 
-      // Add user to DB if not already a participant
-      // if (!room.participants.includes(user._id)) {
-      //   room.participants.push(user._id);
-      //   await room.save();
-      // }
+      socketUserMap.set(socket.id, {
+        roomId: room._id.toString(),
+        userId: user.id,
+      });
 
-      // Add user to DB if not already a participant
-      if (
-        !room.participants.includes(
-          (user) => user.userId.toString() === user._id.toString()
-        )
-      ) {
-        room.participants.push({ userId: user._id, username: user.name });
+      const alreadyExists = room.participants.some(
+        (p) => p.userId.toString() === user.id.toString()
+      );
+
+      if (!alreadyExists) {
+        room.participants.push({ userId: user.id, username: user.name });
         await room.save();
       }
 
-      // Broadcast updated participant list to everyone in the room
-      // const updatedRoom = await QuizRoom.findOne({ roomName }).populate(
-      //   "participants",
-      //   "roomName"
-      // );
+      const updatedRoom = await QuizRoom.findOne({ roomName })
+        .populate("participants", "username userId completed")
+        .populate("hostId", "firstname _id");
 
-      const updatedRoom = await QuizRoom.findOne({ roomName });
-
-      // console.log("Updated participants:", updatedRoom);
-
-      io.to(room._id.toString()).emit(
-        "participantsUpdate",
-        updatedRoom.participants
-      );
+      io.to(room._id.toString()).emit("participantsUpdate", {
+        participants: updatedRoom.participants.map((p) => ({
+          _id: p.userId,
+          name: p.username || p.username, // fallback if no firstname
+          completed: p.completed,
+        })),
+        host: {
+          _id: updatedRoom.hostId?._id,
+          name: updatedRoom.hostId?.firstname || "Host",
+        },
+      });
     } catch (err) {
-      console.error("Error while joining room:", err);
-      socket.emit("joinError", { message: "Server error, please try again" });
+      console.error("joinRoom error:", err);
+      socket.emit("joinError", { message: "Server error" });
     }
   });
 
   // Handle starting the quiz
   socket.on("startQuiz", async ({ roomName }) => {
-    console.log(`Starting quiz in room: ${roomName}`);
+    // console.log(`Starting quiz in room: ${roomName}`);
 
-    const room = await QuizRoom.findOne({ roomName: roomName });
+    // const room = await QuizRoom.findOne({ roomName: roomName });
+    // if (!room) return;
+
+    // room.isStarted = true;
+    // await room.save();
+
+    // let quizId = room.quizId;
+    // io.to(room._id.toString()).emit("quizStarted", { quizId });
+    // io.to(roomName).emit("quizStarted");
+    const updatedRoom = await QuizRoom.findOne({ roomName })
+      .populate("participants", "username userId")
+      .populate("hostId", "firstname _id");
+
+    const room = await QuizRoom.findOne({ roomName });
     if (!room) return;
 
     room.isStarted = true;
     await room.save();
 
-    let quizId = room.quizId;
-    io.to(room._id.toString()).emit("quizStarted", { quizId });
-    // io.to(roomName).emit("quizStarted");
+    const quizId = room.quizId;
+    const participants = room.participants;
+
+    // Notify all non-host users to start quiz
+    participants.forEach((p) => {
+      if (p.userId.toString() !== updatedRoom.hostId?._id) {
+        const targetSocketId = findSocketIdByUser(p.userId.toString()); // implement this
+        if (targetSocketId) {
+          io.to(targetSocketId).emit("quizStarted", { quizId });
+        }
+      }
+    });
+
+    // Notify host with initial stats
+    const hostSocketId = findSocketIdByUser(updatedRoom.hostId?._id); // implement this too
+    if (hostSocketId) {
+      io.to(hostSocketId).emit("quizStatsUpdate", {
+        completedCount: 0,
+        totalParticipants: participants.length - 1,
+        scores: {},
+      });
+    }
   });
+  // const quiz = await Quiz.findById(quizId);
+  // if (!quiz) return;
+
+  // 1️⃣ calculate score
+  // let score = 0;
+  // quiz.questions.forEach((q, idx) => {
+  //   const ans = answers[idx];
+  //   if (!ans) return;
+
+  //   if (["true_false", "single_choice", "short_answer"].includes(q.type)) {
+  //     if (
+  //       ans.toString().trim().toLowerCase() ===
+  //       q.correctAnswer.toString().trim().toLowerCase()
+  //     )
+  //       score++;
+  //   } else if (q.type === "multiple_choice") {
+  //     const ok =
+  //       q.correctAnswer?.length === ans?.length &&
+  //       q.correctAnswer.every((opt) => ans.includes(opt));
+  //     if (ok) score++;
+  //   }
+  // });
 
   socket.on("quizFinished", async ({ roomName, quizId, userId, answers }) => {
     try {
-      const quiz = await Quiz.findById(quizId);
-      if (!quiz) return;
+      // 2️⃣ update DB → set completed + score
+      const room = await QuizRoom.findOneAndUpdate(
+        { roomName, "participants.userId": userId },
+        {
+          $set: {
+            "participants.$.completed": true,
+          },
+        },
+        { new: true }
+      ).populate("hostId", "firstname");
 
-      let score = 0;
+      // 3️⃣ keep in-memory progress (optional)
+      // if (!userProgress[roomName]) userProgress[roomName] = {};
+      // userProgress[roomName][userId] = score;
 
-      quiz.questions.forEach((q, index) => {
-        const userAnswer = answers[index];
+      // // 4️⃣ stats for host
+      // const completedCount = room.participants.filter(
+      //   (p) => p.completed
+      // ).length;
+      // const totalParticipants = room.participants.length - 1; // excluding host
+      const hostSocketId = findSocketIdByUser(room.hostId._id.toString());
 
-        switch (q.type) {
-          case "true_false":
-          case "single_choice":
-          case "short_answer":
-            if (
-              typeof q.correctAnswer === "string" &&
-              userAnswer?.toString().trim().toLowerCase() ===
-                q.correctAnswer.toString().trim().toLowerCase()
-            ) {
-              score++;
-            }
-            break;
-
-          case "multiple_choice":
-            const correctSet = new Set(q.correctAnswer || []);
-            const userSet = new Set(userAnswer || []);
-            const isEqual =
-              correctSet.size === userSet.size &&
-              [...correctSet].every((opt) => userSet.has(opt));
-            if (isEqual) score++;
-            break;
-        }
+      console.log("From quizFinish", room);
+      io.to(room._id.toString()).emit("quizStatsUpdate", {
+        updatedParticipants: room.participants,
       });
+      if (hostSocketId) {
+      }
 
-      // Store progress
-      if (!userProgress[roomName]) userProgress[roomName] = {};
-      userProgress[roomName][userId] = score;
-
-      // Emit real-time stats to all in the room
-      const participants = Object.keys(userProgress[roomName] || {});
-      io.to(roomName).emit("quizStatsUpdate", {
-        completedCount: participants.length,
-        totalParticipants: await QuizRoom.findOne({ roomName }).then(
-          (r) => r?.participants.length || 0
-        ),
-        scores: userProgress[roomName],
-      });
-    } catch (error) {
-      console.error("Error in quizFinished:", error);
+      // 5️⃣ notify this participant of their own score
+      // socket.emit("yourScore", { score });
+    } catch (err) {
+      console.error("quizFinished error:", err);
     }
   });
 
+  /*
   socket.on("quizFinished", ({ roomName, userId }) => {
     if (!roomName || !userId) return;
 
@@ -524,11 +578,50 @@ io.on("connection", (socket) => {
       `[${roomName}] User ${userId} finished. Total finished: ${finishedSet.size}`
     );
   });
+*/
 
   // Handle disconnection
-  socket.on("disconnect", () => {
-    console.log("Client disconnected:", socket.id);
-    // Optionally: Handle user leaving room and update DB if necessary
+  // Handle disconnection
+  socket.on("disconnect", async () => {
+    console.log(roomUsers, "from disconnect quiz");
+
+    const userData = socketUserMap.get(socket.id);
+
+    if (!userData) return;
+
+    const { roomId, userId } = userData;
+
+    try {
+      const room = await QuizRoom.findById(roomId);
+      if (!room) return;
+
+      // Remove user from participants list
+      room.participants = room.participants.filter(
+        (p) => p.userId.toString() !== userId.toString()
+      );
+
+      await room.save();
+
+      // Fetch updated room
+      const updatedRoom = await QuizRoom.findById(roomId)
+        .populate("participants", "username userId")
+        .populate("hostId", "firstname _id");
+
+      io.to(roomId).emit("participantsUpdate", {
+        participants: updatedRoom.participants.map((p) => ({
+          _id: p.userId,
+          name: p.username || p.username, // fallback if no firstname
+        })),
+        host: {
+          _id: updatedRoom.hostId?._id,
+          name: updatedRoom.hostId?.firstname || "Host",
+        },
+      });
+    } catch (error) {
+      console.error("Error handling disconnect:", error);
+    } finally {
+      socketUserMap.delete(socket.id); // Clean up
+    }
   });
 });
 
@@ -592,6 +685,280 @@ app.patch("/api/flashcard/:flashcardId", async (req, res) => {
   } catch (error) {
     res.status(400).send(error);
   }
+});
+
+// ------------------------- new polling -----------------------------
+
+const voteSchema = new mongoose.Schema({
+  type: {
+    type: String,
+    enum: ["text", "chart", "opinion"],
+    required: true,
+  },
+  question: {
+    type: String,
+    required: true,
+  },
+  options: [
+    {
+      type: String,
+      required: true,
+    },
+  ],
+  createdAt: {
+    type: Date,
+    default: Date.now,
+  },
+  createdBy: {
+    userId: String,
+    userName: String,
+  },
+  responses: [
+    {
+      userId: String,
+      selectedOption: String, // or index, depending on your structure
+      votedAt: Date,
+    },
+  ],
+});
+
+const Vote = mongoose.model("Vote", voteSchema);
+
+const roomSchema = new mongoose.Schema({
+  roomName: {
+    type: String,
+    required: true,
+  },
+  passcode: {
+    type: String,
+    required: true,
+  },
+  host: {
+    userId: String,
+    userName: String,
+  },
+  votes: [{ type: mongoose.Schema.Types.ObjectId, ref: "Vote" }],
+  createdAt: {
+    type: Date,
+    default: Date.now,
+  },
+});
+
+let Room = mongoose.model("Room", roomSchema);
+
+app.post("/api/vote/create", async (req, res) => {
+  try {
+    const { type, question, options, userId, userName } = req.body;
+
+    if (!type || !question || !options || options.length < 2) {
+      return res.status(400).json({ message: "Invalid input" });
+    }
+
+    const newVote = new Vote({
+      type,
+      question,
+      options,
+      createdBy: {
+        userId,
+        userName,
+      },
+    });
+
+    const savedVote = await newVote.save();
+
+    res.status(200).json({ success: true, voteId: savedVote._id });
+  } catch (err) {
+    console.error("Vote creation failed:", err);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+// GET /api/vote/user/:userId
+app.get("/api/vote/user/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const votes = await Vote.find({ "createdBy.userId": userId }).sort({
+      createdAt: -1,
+    });
+
+    res.status(200).json(votes);
+  } catch (err) {
+    console.error("Failed to get votes:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.delete("/api/vote/delete/:voteId", async (req, res) => {
+  try {
+    const { voteId } = req.params;
+    await Vote.findByIdAndDelete(voteId);
+    res.status(200).json({ message: "Deleted successfully" });
+  } catch (err) {
+    console.error("Delete error:", err);
+    res.status(500).json({ message: "Failed to delete vote" });
+  }
+});
+
+app.post("/api/vote/room/create", async (req, res) => {
+  try {
+    const { roomName, passcode, userId, userName } = req.body;
+
+    if (!roomName || !passcode) {
+      return res
+        .status(400)
+        .json({ message: "Room name and passcode required" });
+    }
+
+    const newRoom = new Room({
+      roomName,
+      passcode,
+      host: { userId, userName },
+    });
+
+    const savedRoom = await newRoom.save();
+
+    res.status(200).json({ roomId: savedRoom._id });
+  } catch (err) {
+    console.error("Room creation error:", err);
+    res.status(500).json({ message: "Failed to create room" });
+  }
+});
+
+app.delete("/api/vote/room/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await Vote.deleteOne({ _id: id });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to delete vote" });
+  }
+});
+
+app.get("/api/vote/room/:roomId", async (req, res) => {
+  const { roomId } = req.params;
+  try {
+    const room = await Room.findOne({ roomId });
+    if (!room) return res.status(404).json({ error: "Room not found" });
+    res.json(room);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch room" });
+  }
+});
+
+app.post("/api/vote/room/verify", async (req, res) => {
+  const { roomId, passcode } = req.body;
+  console.log("from verify", roomId, passcode);
+
+  try {
+    const room = await Room.findOne({ roomName: roomId, passcode });
+    if (!room) return res.status(404).json({ error: "Invalid room" });
+    console.log("from verify room", room);
+
+    res.json({ hostId: room?.host.userId });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+let roomVotes = {}; // { roomId: { questionId: { option: count } } }
+// let roomUsers = {}; // { roomId: [{ socketId, name, userId }, ...] }
+
+io.on("connection", (socket) => {
+  console.log("Client connected:", socket.id);
+
+  socket.on("join-room", ({ roomId, userInfo }) => {
+    if (!roomUsers[roomId]) roomUsers[roomId] = [];
+    console.log("Joining room:", roomId, userInfo);
+
+    // Prevent duplicate joins from same socket
+    const alreadyInRoom = roomUsers[roomId].some(
+      (u) => u.socketId === socket.id
+    );
+    if (!alreadyInRoom) {
+      roomUsers[roomId].push({
+        socketId: socket.id,
+        firstname: userInfo.firstname,
+        userId: userInfo.id,
+      });
+    }
+
+    socket.join(roomId);
+    console.log("Users in room:", roomUsers[roomId]);
+
+    // Emit updated user list to all in room
+    io.to(roomId).emit("update-user-list", roomUsers[roomId]);
+  });
+
+  socket.on("go-live", ({ roomId, question }) => {
+    if (!roomVotes[roomId]) roomVotes[roomId] = {};
+    roomVotes[roomId][question._id] = {};
+
+    // Initialize vote count for each option
+    question.options.forEach((opt) => {
+      roomVotes[roomId][question._id][opt] = 0;
+    });
+
+    io.to(roomId).emit("question-live", question);
+  });
+
+  socket.on("vote", ({ roomId, questionId, selectedOption }) => {
+    if (
+      roomVotes[roomId] &&
+      roomVotes[roomId][questionId] &&
+      roomVotes[roomId][questionId][selectedOption] !== undefined
+    ) {
+      roomVotes[roomId][questionId][selectedOption] += 1;
+
+      io.to(roomId).emit("update-votes", roomVotes[roomId][questionId]);
+    }
+  });
+
+  socket.on("end-room", ({ roomId }) => {
+    io.to(roomId).emit("room-ended");
+    delete roomVotes[roomId]; // cleanup
+    socket.leave(roomId);
+  });
+
+  socket.on("leave-room", ({ roomId, userId }) => {
+    if (!roomUsers[roomId]) return;
+
+    const prevLength = roomUsers[roomId].length;
+    roomUsers[roomId] = roomUsers[roomId].filter((u) => u.userId !== userId);
+
+    if (roomUsers[roomId].length !== prevLength) {
+      io.to(roomId).emit("update-user-list", roomUsers[roomId]);
+    }
+
+    if (roomUsers[roomId].length === 0) {
+      delete roomUsers[roomId];
+    }
+
+    console.log(`User ${userId} left room ${roomId}`);
+  });
+
+  socket.on("disconnect", () => {
+    console.log(roomUsers, "from disconnect polling");
+
+    for (const roomId in roomUsers) {
+      const prevLength = roomUsers[roomId].length;
+      roomUsers[roomId] = roomUsers[roomId].filter(
+        (u) => u.socketId !== socket.id
+      );
+
+      // If someone was removed, update the room
+      if (roomUsers[roomId].length !== prevLength) {
+        io.to(roomId).emit("update-user-list", roomUsers[roomId]);
+      }
+
+      // Clean up empty room
+      if (roomUsers[roomId].length === 0) {
+        delete roomUsers[roomId];
+      }
+
+      console.log(`User with socket ${socket.id} left room ${roomId}`);
+    }
+  });
 });
 
 const port = process.env.PORT;

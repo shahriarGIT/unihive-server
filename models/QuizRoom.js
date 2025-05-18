@@ -25,6 +25,7 @@ const QuizRoomSchema = new mongoose.Schema({
         required: true,
       },
       username: { type: String, required: true }, // Store the username here
+      completed: { type: Boolean, default: false }, // Track if the user has completed the quiz
     },
   ],
   timerEnabled: { type: Boolean, default: false },
