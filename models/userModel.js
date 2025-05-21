@@ -1,4 +1,3 @@
-// const crypto = require("crypto");
 import mongoose from "mongoose";
 import validator from "validator";
 import bcrypt from "bcryptjs";

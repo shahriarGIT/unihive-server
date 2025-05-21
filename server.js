@@ -1,9 +1,4 @@
 import mongoose, { model } from "mongoose";
-import validator from "validator";
-import express from "express";
-
-import app from "./app.js";
-import server from "./app.js";
 
 import dotenv from "dotenv";
 dotenv.config();
